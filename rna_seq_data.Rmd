@@ -1,0 +1,1376 @@
+---
+title: "Advanced Data Mining Methods in Computational Genomics"
+output: html_document
+---
+
+#### Author: Gabriele Sotto
+
+#### Supervisors: Stefano Monti & Riccardo Bellazzi
+
+
+```{r start2, warning=FALSE, message=FALSE}
+#source("http://bioconductor.org/biocLite.R")
+#biocLite(c("GEOquery", "frma", "ArrayExpress", "biomaRt"))
+#install.packages(c("pROC","caret"),repos="http://cran.r-project.org")
+
+library(GEOquery)
+library(ArrayExpress)
+library(frma)
+library(biomaRt)
+library(reshape2)
+require(Biobase)
+require(CBMRtools)
+require(caret)
+require(limma)
+library(VennDiagram)
+library(rgl)
+require(affy)
+require(rgl)
+require(ggplot2)
+require(heatmap.plus)
+library(ConsensusClusterPlus)
+library(gplots)
+
+PATH <- "data/"
+
+collapseByMedian<-function(eset, rowid){
+    #library(reshape2)
+
+    #remove unmapped probe sets
+    genes<-fData(eset)[, rowid]
+    rows.mapped<-!is.na(genes) & genes != ""
+    eset<-eset[rows.mapped,]
+    genes<-fData(eset)[, rowid]
+
+    #collapse by median value among duplicate probes
+    df<-data.frame(exprs(eset), genes = genes)
+    df.melt<-melt(df, id.vars = "genes")
+    df.median.collapsed<-dcast(df.melt, genes ~ variable, median, fill=NaN)
+
+    #reassemble collapsed eset
+    fdat<-fData(eset)
+    fdat.collapsed<-fdat[!duplicated(fdat[, rowid]), ] #keep first rows of duplicated fData entries
+    row.order<-match(fdat.collapsed[, rowid], df.median.collapsed$genes)
+    df.median.collapsed <-df.median.collapsed[row.order,]
+    exprs(eset)<-as.matrix(df.median.collapsed[, colnames(eset)])
+    fData(eset)<-fdat.collapsed
+    return(eset)
+}
+```
+
+## 2. Analysis of an RNA-seq HSNC Dataset
+
+For many applications, we are interested in measuring the absolute or relative expression of each mRNA in the cell. So in this second problem we analyse another type of data: a RNA-seq count data. In recent years, a novel methodology for RNA sequencing, called RNA-seq, is replacing microarrays for the study of gene expression.In this method millions of short sequences, called reads, are sequenced from random positions of the input RNAs. These reads can then be computationally mapped on a reference genome to reveal a transcriptional map, where the number of reads aligned on each gene, called counts, gives a measure of its level of expression.
+In this new section we perform analysis of the TCGA head and neck squamous carcinoma (HNSC) dataset. The dataset can be downloaded as raw counts. We start to remove all mitochondrial genes, as well as non-coding RNAs, and Ensemble IDs without an associated gene symbol. This will considerably reduce the size (number of rows) of the data. Also, we want to ‘merge’ multiple Ensemble IDs associated to the same gene symbol.
+
+```{r HSNC, warning=FALSE, message=FALSE}
+
+library(DESeq2)
+library(edgeR)
+library(BiocParallel)
+
+HNSC_rawCounts<-readRDS(paste(PATH,"HNSC_htseq_raw_counts.anonymized.RDS",sep=""))
+HNSC_rawCounts
+
+#remove the MT genes
+
+HNSC_rawCounts<-subset(HNSC_rawCounts,fData(HNSC_rawCounts)$chromosome_name != "MT")
+
+#remove the genes with hgnc_symbol = ""
+
+HNSC_rawCounts<-subset(HNSC_rawCounts,fData(HNSC_rawCounts)$hgnc_symbol != "")
+HNSC_rawCounts.collapsed<-collapseByMedian(HNSC_rawCounts, "hgnc_symbol")
+
+#this is the list of non coding
+hnsc <- subset(HNSC_rawCounts.collapsed, regexpr("non-protein",strsplit(fData(HNSC_rawCounts.collapsed)$description, " "))!=-1) 
+
+HNSC <- subset(HNSC_rawCounts.collapsed,!(fData(HNSC_rawCounts.collapsed)$hgnc_symbol %in% fData(hnsc)$hgnc_symbol))
+
+exprs(HNSC)<-round(exprs(HNSC))
+
+saveRDS(HNSC, paste(PATH, "/", "HNSC.RDS", sep = ""))
+
+```
+
+Now we need to filter out genes with mostly zero counts. In fact we have a large number of rows contain all zero so we want to eliminate them. We also grouped the classes (the grade g1,g2,g3 and g4) in order to get a problem with binary class: the first class is "g1" (group that include g1 and g2) and the second is "g4" (group that include g3 and g4).
+Even the stage was grouped in two groups "stage i" (group that include stage i, ii and iii) and "stage iv". 
+After this step is also useful to apply a log-transform: since count values for a gene can be zero in some conditions (and non-zero in others), some advocate the use of pseudocounts. These data are useful for clustering, PCA and classification. Contrariwise in differential analysis the used methods require count data, so we decided to create two different data frame.
+
+```{r HSNC 2, warning=FALSE, message=FALSE}
+
+
+#HNSC<-readRDS(paste(PATH,"HNSC.RDS",sep=""))
+
+# now we remove the genes with a large number of 0 in count
+HNSCF <- HNSC[rowSums(exprs(HNSC))>100,]
+
+# we replace g2 with g1 and g3 with g4. We obtain 2 class g1 (g1-2) and g4 (g3-4)
+ind2 <- which(pData(HNSCF)$patient.neoplasm_histologic_grade == "g2")
+pData(HNSCF)$patient.neoplasm_histologic_grade<-replace(pData(HNSCF)$patient.neoplasm_histologic_grade,ind2,"g1")
+
+ind3 <- which(pData(HNSCF)$patient.neoplasm_histologic_grade == "g3")
+pData(HNSCF)$patient.neoplasm_histologic_grade<-replace(pData(HNSCF)$patient.neoplasm_histologic_grade,ind3,"g4")
+
+HNSCF <- HNSCF[,pData(HNSCF)$patient.neoplasm_histologic_grade %in% c("g1","g4")]
+pData(HNSCF)$patient.neoplasm_histologic_grade <- factor(pData(HNSCF)$patient.neoplasm_histologic_grade)
+
+#we replace stage ii and iii with stage i
+
+ind4 <- which(pData(HNSCF)$patient.stage_event.clinical_stage == "stage ii")
+pData(HNSCF)$patient.stage_event.clinical_stage<-replace(pData(HNSCF)$patient.stage_event.clinical_stage,ind4,"stage i")
+
+ind5 <- which(pData(HNSCF)$patient.stage_event.clinical_stage == "stage iii")
+pData(HNSCF)$patient.stage_event.clinical_stage<-replace(pData(HNSCF)$patient.stage_event.clinical_stage,ind5,"stage i")
+
+HNSCF <- HNSCF[,pData(HNSCF)$patient.stage_event.clinical_stage %in% c("stage i","stage iv")]
+pData(HNSCF)$patient.stage_event.clinical_stage <- factor(pData(HNSCF)$patient.stage_event.clinical_stage)
+
+HNSCF_log <-HNSCF
+
+#exprs(HNSCF_log) <- log2(exprs(HNSCF)+1) 
+
+exprs(HNSCF_log) <- cpm(exprs(HNSCF_log),log = TRUE)
+
+```
+
+
+### 2.1 Principal Component Analysis (PCA)
+
+As in the previus problem, we start by perform a Principal Component Analysis and plot data onto the first two PCs, and the 1st and 3rd PCs, by coloring the data points by grade and stage.
+
+```{r hnsc pca, warning=FALSE, message=FALSE}
+
+require(rgl)
+require(ggplot2)
+
+# run PCA
+data.pca <- prcomp(t(exprs(HNSCF_log)))  
+data.pca1.2 <- data.pca$x[,1:2] # take the first 2 components
+data.pca1.3 <- data.pca$x[,1:3] # take the first and the third components
+
+(summary(data.pca)$importance)[,1:50]
+
+## extract label
+col.palette <- c("green","red","blue","black","magenta")
+
+#HISTOLOGIC GRADE
+colors <- col.palette[as.numeric(as.factor(HNSCF_log$patient.neoplasm_histologic_grade))]
+## basic 2D plot
+plot(x=data.pca1.2[,1],y=data.pca1.2[,2],pch=20,xlab="1st PCA",ylab="2nd PCA",col=colors)
+legend("topleft",pch=20,legend=levels(factor(HNSCF_log$patient.neoplasm_histologic_grade)), col=col.palette)
+
+plot(x=data.pca1.3[,1],y=data.pca1.3[,3],pch=20,xlab="1st PCA",ylab="3rd PCA",col=colors)
+legend("topleft",pch=20,legend=levels(factor(HNSCF_log$patient.neoplasm_histologic_grade)), col=col.palette)
+
+
+#STAGE EVENT
+colors <- col.palette[as.numeric(as.factor(HNSCF_log$patient.stage_event.clinical_stage))]
+## basic 2D plot
+plot(x=data.pca1.2[,1],y=data.pca1.2[,2],pch=20,xlab="1st PCA",ylab="2nd PCA",col=colors)
+legend("topleft",pch=20,legend=levels(as.factor(HNSCF_log$patient.stage_event.clinical_stage)), col=col.palette)
+
+plot(x=data.pca1.3[,1],y=data.pca1.3[,2],pch=20,xlab="1st PCA",ylab="3rd PCA",col=colors)
+legend("topleft",pch=20,legend=levels(as.factor(HNSCF_log$patient.stage_event.clinical_stage)), col=col.palette)
+
+```
+
+In this case we note that we are not able to identify some natural clusters in the data and we have a lot of noise. However we consider only two components and for doing a more accurate analysis we have to consider more components because the variance that these components describe are very low. So we can try, in the next section, with hierarchical clustering to find out some clusters in the data.
+
+### 2.2 Hierarchical clustering
+
+```{r hnsc hierarchial clustering, warning=FALSE, message=FALSE}
+
+HNSCF2_log <- variationFilter(HNSCF_log,ngenes=3000, score="sd",do.plot=TRUE)
+
+distmatrix.col<-dist(t(exprs(HNSCF2_log)))
+## using ward clustering 
+hc01.col <- hclust(distmatrix.col,method="ward.D") 
+hc01.col 
+
+## calculate distance matrix for rows: use correlation for rows/genes
+distmatrix.row<-as.dist(1-cor(t(exprs(HNSCF2_log))))
+## using ward clustering
+hc01.row <- hclust(distmatrix.row,method="ward.D") 
+
+## making heatmap for grade
+levels(as.factor(HNSCF2_log$patient.neoplasm_histologic_grade))
+
+col.palette <- c("green", "purple","red")
+colors <- col.palette[as.numeric(as.factor(HNSCF2_log$patient.neoplasm_histologic_grade))]
+heatmaptitle <- paste(" ", "top sd-filtered 3k genes", sep = "")
+heatmap.2(exprs(HNSCF_log),
+          trace='none',
+          main=heatmaptitle,
+          col=bluered(64),
+          dendrogram='both',
+          scale='row',
+          ColSideColors=colors,
+          Colv=as.dendrogram(hc01.col),
+          Rowv=as.dendrogram(hc01.row),
+          margins=c(6,6))
+legend("topright", c('g1','g2'),
+       pch=15,pt.cex=2,col=col.palette,ncol=1,title.adj=0,cex=1,bty='n')
+
+
+## making heatmap for stage
+levels(as.factor(HNSCF2_log$patient.stage_event.clinical_stage))
+
+col.palette <- c("green", "purple","red","lightblue", "pink")
+colors <- col.palette[as.numeric(as.factor(HNSCF2_log$patient.stage_event.clinical_stage))]
+heatmaptitle <- paste(" ", "top sd-filtered 3k genes", sep = "")
+heatmap.2(exprs(HNSCF_log),
+          trace='none',
+          main=heatmaptitle,
+          col=bluered(64),
+          dendrogram='both',
+          scale='row',
+          ColSideColors=colors,
+          Colv=as.dendrogram(hc01.col),
+          Rowv=as.dendrogram(hc01.row),
+          margins=c(6,6))
+legend("topright", levels(as.factor(HNSCF_log$patient.stage_event.clinical_stage)),
+       pch=15,pt.cex=2,col=col.palette,ncol=1,title.adj=0,cex=1,bty='n')
+
+```
+
+As well as we note in the previous analysis with PCA, using the hierarchical clustering we note that we are not able to identify some natural clusters in these data and we have a lot of noise. So this case is different from the first and probably building a classifier with an high accuracy will be very difficult.
+
+
+### 2.3 RNA-seq differential expression analysis with DEseq2 and edgeR
+
+Just as we did in the previous problem with microarray data, now we want to perform a differential analysis. A gene is declared differentially expressed if an observed difference or change in read counts between two experimental conditions is statistically significant (if the difference is greater than what would be expected just due to random variation). In particular we want to perform differential analysis with respect to grade (g1 vs. g4) and stage (stage1-3 vs. stage4) using edgeR and Deseq2 and compare results. 
+Also we want to use the differential analysis like a method for features selection. So before starting, we split the dataset into a 60/40 stratified pair of datasets. We have used the 60% portion as the discovery set and the 40% portion as the validation set. In this case we perform a features selection of type "supervised" so, to ensure that the results of our classifiers are not polarized, we perform the differential analysis only on the discovery set, like in the previous problem.
+
+Let’s start by splitting the dataset and writing wrapper functions for each tool:
+
+```{r hnsc diffanal, warning=FALSE, message=FALSE}
+
+set.seed(3456) # for reproducible results
+trainIndex <- createDataPartition(HNSCF2_log$patient.neoplasm_histologic_grade, p = 0.6, list = FALSE, times = 1)
+
+trainingSet <- HNSCF2_log[,trainIndex]
+testSet <- HNSCF2_log[,-trainIndex]
+
+HNSCF.allSamples <- HNSCF
+HNSCF<- HNSCF[,trainIndex]
+
+# we consider only the 3k best genes, but not log-transf
+HNSCF <- subset(HNSCF,fData(HNSCF)$hgnc_symbol %in% fData(HNSCF2_log)$hgnc_symbol)
+
+## wrapper for running DESeq2
+##
+run_deseq <- function(eset, class_id, group1, group2){
+ 
+  group1_inds <- which(pData(eset)[, class_id] %in% group1)
+  group2_inds <- which(pData(eset)[, class_id] %in% group2)
+  eset.group1 <- eset[, group1_inds]
+  eset.group2 <- eset[, group2_inds]
+  eset.compare <- eset[, c(group1_inds, group2_inds)]
+
+  #make deseq2 compliant dataset
+  colData <- data.frame(condition=as.character(pData(eset.compare)[, class_id]))
+  dds <- DESeqDataSetFromMatrix(exprs(eset.compare), colData, formula( ~ condition))
+
+  #set reference to control, otherwise default is alphabetical order
+  dds$condition <- factor(dds$condition, levels=c(group1,group2))
+
+  #run deseq2
+  #3 steps:
+  #1.) estimate size factors
+  #2.) estimate dispersion
+  #3.) negative binomial GLM fitting and wald test
+  dds_res <- DESeq(dds)
+  res <- results(dds_res)
+  return(res)
+}
+## wrapper for running edgeR
+##
+run_edgeR <- function(eset, class_id, group1, group2){
+  
+
+  group1_inds <- which(pData(eset)[, class_id] %in% group1)
+  group2_inds <- which(pData(eset)[, class_id] %in% group2)
+
+  eset.group1 <- eset[, group1_inds]
+  eset.group2 <- eset[, group2_inds]
+  eset.compare <- eset[, c(group1_inds, group2_inds)]
+  condition <- as.character(pData(eset.compare)[, class_id])
+
+  y <- DGEList(counts=exprs(eset.compare), group = condition)
+  y <- calcNormFactors(y)
+  y <- estimateGLMCommonDisp(y)
+  y <- estimateGLMTrendedDisp(y)
+  y <- estimateGLMTagwiseDisp(y)
+  et <- exactTest(y)
+  res <- topTags(et, n = nrow(eset.compare),  sort.by = "none")
+  return(res)
+}
+
+## optional: reattach empirical measurements / gene annotation to DE results
+##
+summarize_results <- function(res, eset, class_id, group1, group2){
+  group1_inds <- which(pData(eset)[, class_id] %in% group1)
+  group2_inds <- which(pData(eset)[, class_id] %in% group2)
+  eset.group1 <- eset[, group1_inds]
+  eset.group2 <- eset[, group2_inds]
+
+  eset.ordered <- match(rownames(res), rownames(eset))
+  res <- cbind(res, fData(eset)[eset.ordered,])
+  res$rowmeans.group1 <- rowMeans(exprs(eset.group1)[eset.ordered,])
+  res$rowmeans.group1 <- rowMeans(exprs(eset.group2)[eset.ordered,])
+
+  res$log2fc <- log2(res$rowmeans.group2/res$rowmeans.group1)
+  index <- (res$rowmeans.group2 <= res$rowmeans.group1)
+  res$log2fc[index] <- -abs(res$log2fc[index])
+  return(res)
+}
+
+```
+
+Now the first package that we want to use is DEseq2. As input, the DESeq2 package expects count data in the form of a matrix of integer values. This method is based on a model using negative binomial generalized linear models; the estimates of dispersion and logarithmic fold changes incorporate data-driven prior distributions. The function preforms a default analysis through the steps:
+<ul type=”disc”>
+<li>estimation of size factors</li>
+  <li>estimation of dispersion</li>
+  <li>Negative Binomial GLM fitting and Wald statistics</li>
+</ul>
+
+
+```{r hnsc DEseq2, warning=FALSE, message=FALSE}
+
+#grade
+res_deseq2 <- run_deseq(eset = HNSCF, class_id = "patient.neoplasm_histologic_grade",
+group1 = "g1", group2 = "g4")
+
+#stage
+res_deseq2_stage <- run_deseq(eset = HNSCF, class_id = "patient.stage_event.clinical_stage",
+group1 = "stage i", group2 = "stage iv")
+
+```
+
+The second method is edgeR. The package implements statistical methods based on generalized linear models. The glm functions can test for differential expression using either likelihood ratio tests or quasi-likelihood F-tests. A particular feature of edgeR functionality are empirical Bayes methods that permit the estimation of gene-specific biological variation, even for experiments with minimal levels of biological replication.
+
+```{r hnsc edgeR, warning=FALSE, message=FALSE}
+
+## grade
+res_edgeR <- run_edgeR(eset = HNSCF, class_id = "patient.neoplasm_histologic_grade",
+ group1 = "g1", group2 = "g4")
+
+#stage
+res_edgeR_stage <- run_edgeR(eset = HNSCF, class_id = "patient.stage_event.clinical_stage",
+ group1 = "stage i", group2 = "stage iv")
+
+```
+
+#### 2.3.1 Comparing results for grade
+
+Now we want to compare the results for the grade of DEseq2 and edgeR and visualize the overlap as a Venn diagram.
+
+```{r hnsc compare grade, warning=FALSE, message=FALSE}
+
+## cumulative number of sig genes below mean expression
+res_summary <- data.frame(deseq2_padj=res_deseq2$padj, 
+  edgeR_padj = res_edgeR$table$FDR,
+  deseq2_logfc=res_deseq2$log2FoldChange, 
+  edgeR_logfc = res_edgeR$table$logFC,
+  mean_exprs = rowMeans(log10(exprs(HNSCF)+1)))
+
+## for plotting purposes
+exprs_breaks <- seq(0, log10(max(as.numeric(exprs(HNSCF)+1))), 0.01)
+
+## cumulative significant genes vs. log10 mean expression
+csg_DESeq2 <- sapply(exprs_breaks, 
+  function(x) nrow(subset(res_summary, mean_exprs < x & deseq2_padj < 0.1)))
+
+csg_edgeR <- sapply(exprs_breaks, 
+  function(x) nrow(subset(res_summary, mean_exprs < x & edgeR_padj < 0.1)))
+
+plot(exprs_breaks, csg_DESeq2, 
+  type = "l",
+  col = "red",
+  xaxt="n",
+  xlab = "log10 expression", 
+  ylab = "cumulative significant genes (fdr 0.05)",
+  main = "Cumulative number of significant genes by log10 count")
+lines(exprs_breaks, csg_edgeR, type = "l", col = "blue")
+
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+legend("right", c("DEseq2", "edgeR"), 
+  col=c("red", "blue"), lwd=10)
+
+
+## normalization to proportion of significant genes instead of absolute number
+##
+plot(exprs_breaks, csg_DESeq2/max(csg_DESeq2), 
+  type = "l",
+  col = "red",
+  xaxt="n",
+  xlab = "log10 expression", 
+  ylab = "cumulative proportion of significant genes (fdr 0.05)",
+  main = "Cumulative proportion of significant genes by log10 count")
+lines(exprs_breaks, csg_edgeR/max(csg_edgeR), type = "l", col = "blue")
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+legend("right", c("DEseq2", "edgeR"), 
+  col=c("red", "blue"), lwd=10)
+
+## histogram of proportion of sig genes by mean expression
+##
+hist(subset(res_summary, deseq2_padj <0.1)[, "mean_exprs"], freq=FALSE,
+  col=rgb(1,0,0,1/4), xlab = "log10 expression", 
+  ylab = "number of sig. genes (fdr 0.05)",
+  main = "Proportion of number of significant genes by log10 count", xaxt = "n")
+hist(subset(res_summary, edgeR_padj <0.1)[, "mean_exprs"],freq=FALSE,
+  col=rgb(0,0,1,1/4), add = T)
+labels <- sapply(1:5,function(i)
+            as.expression(bquote(10^ .(i)))
+          )
+axis(1,at=1:5,labels=labels)
+box()
+legend("topright", c("DEseq2", "edgeR"), 
+  col=c(rgb(1,0,0,1/4), rgb(0,0,1,1/4), rgb(1,1,0,1/4)), lwd=10)
+
+#expected results: DESeq claims edgeR is anti-conservative for lowly expressed genes, and 
+#more conservative for strongly expressed genes (weakly expressed genes overrepresented)
+
+#Comparing MA-plots: Expression level vs. log Fold Change
+
+plot(res_summary$mean_exprs, res_summary$deseq2_logfc, 
+  pch = ".",
+  col = factor(res_summary$deseq2_padj<0.1),
+  xaxt="n",
+  xlab = "expression", 
+  ylab = "log fold change",
+  main = "MA-plot Deseq2", ylim = c(-2, 2))
+abline(0,0, col = "red")
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+
+plot(res_summary$mean_exprs, res_summary$edgeR_logfc, 
+  pch = ".",
+  col = factor(res_summary$deseq2_padj<0.1),
+  xaxt="n",
+  xlab = "expression", 
+  ylab = "log fold change",
+  main = "MA-plot edgeR", ylim = c(-2, 2))
+abline(0,0, col = "red")
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+
+
+#Venn Diagrams of Gene Signatures
+
+diff_list <- list(DESeq2 = rownames(subset(res_summary, deseq2_padj < 0.1)),
+  edgeR = rownames(subset(res_summary, edgeR_padj < 0.1)))
+
+fill <- c("light blue", "pink")
+size  <- rep(0.5,2)
+venn <- venn.diagram(x = diff_list, 
+        filename = NULL,
+      height = 2000,
+      width = 2000, fill = fill,
+      cat.default.pos = "text", 
+      cat.cex = size,
+      main = "Overlap of Signficant genes (FDR 0.1)")
+grid.newpage()
+grid.draw(venn)
+
+```
+
+In these graphics we note that the are some differences beetween the two methods. In particular we note, just as we expected, that edgeR is much more restrictive and select fewer genes as significant.
+
+#### 2.3.1 Comparing results for stage
+
+Now we compare the results for the stage. 
+
+```{r hnsc compare stage, warning=FALSE, message=FALSE}
+
+## cumulative number of sig genes below mean expression
+res_summary_stage <- data.frame(deseq2_padj_stage=res_deseq2_stage$padj, 
+  edgeR_padj_stage = res_edgeR_stage$table$FDR,
+  deseq2_logfc_stage=res_deseq2_stage$log2FoldChange, 
+  edgeR_logfc_stage = res_edgeR_stage$table$logFC,
+  mean_exprs = rowMeans(log10(exprs(HNSCF)+1)))
+
+## for plotting purposes
+exprs_breaks <- seq(0, log10(max(as.numeric(exprs(HNSCF)+1))), 0.01)
+
+## cumulative significant genes vs. log10 mean expression
+csg_DESeq2_stage <- sapply(exprs_breaks, 
+  function(x) nrow(subset(res_summary_stage, mean_exprs < x & deseq2_padj_stage < 0.1)))
+
+csg_edgeR_stage <- sapply(exprs_breaks, 
+  function(x) nrow(subset(res_summary_stage, mean_exprs < x & edgeR_padj_stage < 0.1)))
+
+plot(exprs_breaks, csg_DESeq2_stage, 
+  type = "l",
+  col = "red",
+  xaxt="n",
+  xlab = "log10 expression", 
+  ylab = "cumulative significant genes (fdr 0.05)",
+  main = "Cumulative number of significant genes by log10 count")
+lines(exprs_breaks, csg_edgeR_stage, type = "l", col = "blue")
+
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+legend("right", c("DEseq2", "edgeR"), 
+  col=c("red", "blue"), lwd=10)
+
+
+## normalization to proportion of significant genes instead of absolute number
+##
+plot(exprs_breaks, csg_DESeq2_stage/max(csg_DESeq2_stage), 
+  type = "l",
+  col = "red",
+  xaxt="n",
+  xlab = "log10 expression", 
+  ylab = "cumulative proportion of significant genes (fdr 0.05)",
+  main = "Cumulative proportion of significant genes by log10 count")
+lines(exprs_breaks, csg_edgeR_stage/max(csg_edgeR_stage), type = "l", col = "blue")
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+legend("right", c("DEseq2", "edgeR"), 
+  col=c("red", "blue"), lwd=10)
+
+## histogram of proportion of sig genes by mean expression
+##
+hist(subset(res_summary_stage, deseq2_padj_stage <0.1)[, "mean_exprs"], freq=FALSE,
+  col=rgb(1,0,0,1/4), xlab = "log10 expression", 
+  ylab = "number of sig. genes (fdr 0.05)",
+  main = "Proportion of number of significant genes by log10 count", xaxt = "n")
+hist(subset(res_summary_stage, edgeR_padj_stage <0.1)[, "mean_exprs"],freq=FALSE,
+  col=rgb(0,0,1,1/4), add = T)
+labels <- sapply(1:5,function(i)
+            as.expression(bquote(10^ .(i)))
+          )
+axis(1,at=1:5,labels=labels)
+box()
+legend("topright", c("DEseq2", "edgeR"), 
+  col=c(rgb(1,0,0,1/4), rgb(0,0,1,1/4), rgb(1,1,0,1/4)), lwd=10)
+
+
+#Comparing MA-plots: Expression level vs. log Fold Change
+
+plot(res_summary_stage$mean_exprs, res_summary_stage$deseq2_logfc_stage, 
+  pch = ".",
+  col = factor(res_summary_stage$deseq2_padj_stage<0.1),
+  xaxt="n",
+  xlab = "expression", 
+  ylab = "log fold change",
+  main = "MA-plot Deseq2", ylim = c(-2, 2))
+abline(0,0, col = "red")
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+
+plot(res_summary_stage$mean_exprs, res_summary_stage$edgeR_logfc_stage, 
+  pch = ".",
+  col = factor(res_summary_stage$deseq2_padj_stage<0.1),
+  xaxt="n",
+  xlab = "expression", 
+  ylab = "log fold change",
+  main = "MA-plot edgeR", ylim = c(-2, 2))
+abline(0,0, col = "red")
+labels <- sapply(1:5,function(i) as.expression(bquote(10^ .(i))))
+axis(1,at=1:5,labels=labels)
+
+
+#Venn Diagrams of Gene Signatures
+
+diff_list_stage <- list(DESeq2_stage = rownames(subset(res_summary_stage, deseq2_padj_stage < 0.1)),
+  edgeR_stage = rownames(subset(res_summary_stage, edgeR_padj_stage < 0.1)))
+
+fill <- c("light blue", "pink")
+size  <- rep(0.5,2)
+venn <- venn.diagram(x = diff_list_stage, 
+        filename = NULL,
+      height = 2000,
+      width = 2000, fill = fill,
+      cat.default.pos = "text", 
+      cat.cex = size,
+      main = "Overlap of Signficant genes (FDR 0.1)")
+grid.newpage()
+grid.draw(venn)
+
+```
+
+Even in this case we have some difference beetween the two methods. But in this case we see that the number of significant genes for the two methods is similar. 
+
+### 2.4 Differential analysis using JAGS
+
+Another way to perform a differential analysis is to use JAGS based on a GLM model. Just another Gibbs sampler (JAGS) is a program for simulation from Bayesian hierarchical models using Markov chain Monte Carlo (MCMC).
+In particular we used a GLM model based on the Poisson distribution and on the Negative Binomial distribution. 
+
+
+The count is a discrete measure therefore the statistics descriptions of the data usually used are non applicable to RNA-Seq data and new models are therefore needed. The two of the greatest interest are the Poisson model and the Negative Binomial model. The first is a model that describes the distribution of the data through a single parameter, which represents both the average and the variance. It is a simple model, which requires the estimation of one parameter. But it is precisely this simplicity to represent its main limitation: usually the RNA-Seq data has a dispersion that is not represented by the variance-mean relationship envisaged by the Poisson model. If the variance is greater than the average, the data are said overdisperded and, for this reason, the use of Poisson distribution is inappropriate. The Binomial Negative model also extends the description in dispersed data, by the estimation of a second parameter which represents precisely the dispersion coefficient.
+
+
+These methods have a very high computational cost so we apply a drastic variation filter for reduce the dataset to 100 genes. For each model we report 95% and 99% Credible Intervals (CIs) of the fold change for the 100 genes, and we identify those whose CIs deviate from 1. For doing this analysis we used the entire data set.
+
+```{r jags, message=FALSE, warning=FALSE}
+
+HNSCF3_log <- variationFilter(HNSCF_log,ngenes=100, score = "sd", do.plot=TRUE)
+HNSCF2 <- subset(HNSCF.allSamples,fData(HNSCF.allSamples)$hgnc_symbol %in% fData(HNSCF3_log)$hgnc_symbol)
+
+require(Biobase)
+require(rjags)
+
+dataList <- list(x = as.numeric(pData(HNSCF2)$patient.neoplasm_histologic_grade),y = exprs(HNSCF2)[1,], nSample = ncol(HNSCF2))
+
+```
+
+#### 2.4.1 JAGS with Poisson model
+
+```{r test.uniJAGS, message=FALSE, warning=FALSE}
+
+jagFile <- paste(PATH,"../jags/models/GLMpois2.jags",sep="")
+#see content of jags file
+writeLines(readLines(jagFile))
+
+model <- jags.model(jagFile, 
+                    data = dataList,
+                    n.chains = 3, 
+                    n.adapt = 1000,
+                    quiet = TRUE)
+update(model,n.iter=1000)
+
+## run JAGS
+vars <- c("fold.change")
+samples <- coda.samples(model,
+                        variable.names = vars, 
+                        n.iter = 1000, 
+                        thin = 1)
+plot(samples)
+gelman.diag(samples)
+summary(samples)
+
+jagsDiffanal <- function(datI,jagFile,n.adapt=1000,n.update=1000,n.iter=1000,quiet=TRUE)
+{
+  progress.bar <- if (quiet) "none" else "text"
+  if (!quiet) cat("loading model\n")
+  model <- jags.model(jagFile, 
+                      data = c( list(gene.data=datI), dataList ),
+                      n.chains = 1, 
+                      n.adapt = n.adapt,
+                      quiet = quiet)
+  ## burnin
+  if (!quiet) cat("burnin\n")
+  update(model,n.iter=n.update,progress.bar=progress.bar)
+
+  ## variables to monitor
+  vars <- c("fold.change")
+    
+  if ( !quiet ) cat( "sampling ..")
+  samples <- coda.samples(model,
+                          variable.names = vars, 
+                          n.iter = n.iter, 
+                          thin = 1,
+                          quiet=quiet,
+                          progress.bar=progress.bar)
+  tmp <- summary(samples, quantiles = c(0.005,0.995,0.025,0.975))
+  c(tmp$statistics,tmp$quantiles)
+}
+OUT_pois <- t(apply(exprs(HNSCF2), 1, jagsDiffanal, jagFile=jagFile, quiet=TRUE))
+
+## check which genes have a 95% CI of the fold-change not intersecting with 1
+sig <- ((OUT_pois[,"2.5%"] < 1) & (OUT_pois[,"97.5%"] < 1)) | ((OUT_pois[,"2.5%"] > 1) & (OUT_pois[,"97.5%"] > 1))
+
+## augment the data output with that information
+OUT1 <- cbind(OUT_pois,significant=sig)    
+
+## check which genes have a 99% CI of the fold-change not intersecting with 1
+sig2 <- ((OUT_pois[,"0.5%"] < 1) & (OUT_pois[,"99.5%"] < 1)) | ((OUT_pois[,"0.5%"] > 1) & (OUT_pois[,"99.5%"] > 1))
+
+OUT2 <- cbind(OUT_pois,significant=sig2)  
+
+```
+
+#### 2.4.2 Differential analysis using JAGS with negative binomial model
+
+```{r jags bineg, message=FALSE, warning=FALSE}
+
+jagFile <- paste(PATH,"../jags/models/GLMbineg2.jags",sep="")
+#see content of jags file
+writeLines(readLines(jagFile))
+
+model <- jags.model(jagFile, 
+                    data = dataList ,
+                    n.chains = 3, 
+                    n.adapt = 1000,
+                    quiet = FALSE)
+#burnin
+update(model,n.iter=1000)
+
+## run JAGS
+vars <- c("fold.change")
+samples <- coda.samples(model,
+                        variable.names = vars, 
+                        n.iter = 1000, 
+                        thin = 1)
+plot(samples)
+gelman.diag(samples)
+summary(samples)
+
+jagsDiffanal <- function(datI,jagFile,n.adapt=1000,n.update=1000,n.iter=1000,quiet=TRUE)
+{
+  progress.bar <- if (quiet) "none" else "text"
+  if (!quiet) cat("loading model\n")
+  model <- jags.model(jagFile, 
+                      data = c( list(gene.data=datI), dataList ),
+                      n.chains = 1, 
+                      n.adapt = n.adapt,
+                      quiet = quiet)
+  ## burnin
+  if (!quiet) cat("burnin\n")
+  update(model,n.iter=n.update,progress.bar=progress.bar)
+
+  ## variables to monitor
+  vars <- c("fold.change")
+    
+  if ( !quiet ) cat( "sampling ..")
+  samples <- coda.samples(model,
+                          variable.names = vars, 
+                          n.iter = n.iter, 
+                          thin = 1,
+                          quiet=quiet,
+                          progress.bar=progress.bar)
+  tmp <- summary(samples, quantiles = c(0.005,0.995,0.025,0.975))
+  c(tmp$statistics,tmp$quantiles)
+}
+OUT <- t(apply(exprs(HNSCF2), 1, jagsDiffanal, jagFile=jagFile, quiet=TRUE))
+
+## check which genes have a 95% CI of the fold-change not intersecting with 1
+sig_bineg <- ((OUT[,"2.5%"] < 1) & (OUT[,"97.5%"] < 1)) | ((OUT[,"2.5%"] > 1) & (OUT[,"97.5%"] > 1))
+
+## augment the data output with that information
+OUT1_bineg <- cbind(OUT,significant=sig_bineg)    
+
+## check which genes have a 99% CI of the fold-change not intersecting with 1
+sig2_bineg <- ((OUT[,"0.5%"] < 1) & (OUT[,"99.5%"] < 1)) | ((OUT[,"0.5%"] > 1) & (OUT[,"99.5%"] > 1))
+
+OUT2_bineg <- cbind(OUT,significant=sig2_bineg)  
+
+```
+
+#### 2.4.3 Comparing results 
+
+Now we want to compare the results and we visualize the overlap as a Venn diagram.
+
+```{r jags comparing, message=FALSE, warning=FALSE}
+
+
+#Venn diagram for genes have a 95% CI of the fold-change not intersecting with 1
+top.poisRes <- rownames(subset(OUT1, OUT1[,"significant"]==1))
+top.binegRes <- rownames(subset(OUT1_bineg, OUT1_bineg[,"significant"]==1))
+
+top <- list(top.poisRes = top.poisRes, top.binegRes = top.binegRes)
+
+fill <- c("light blue","light green")
+p <- venn.diagram(x = top, filename = NULL, fill = fill, main = "Overlap for 95% CI")
+grid.newpage()
+grid.draw(p)
+
+
+# Venn diagram for genes have a 99% CI of the fold-change not intersecting with 1
+top.poisRes <- rownames(subset(OUT2, OUT2[,"significant"]==1))
+top.binegRes <- rownames(subset(OUT2_bineg, OUT2_bineg[,"significant"]==1))
+
+top <- list(top.poisRes = top.poisRes, top.binegRes = top.binegRes)
+
+fill <- c("light blue","light green")
+p <- venn.diagram(x = top, filename = NULL, fill = fill, main = "Overlap for 99% CI")
+grid.newpage()
+grid.draw(p)
+
+```
+
+In these diagram we note that there are some differences between the two models, in particular we note that the number of significant genes for the negative binomial model is less than the number of Poisson model. The problem is that the number of genes are too low. For obtaining more significant results we have to work with more genes, but the computational cost is too hight (for doing this work with 500 genes I use a MacBook Pro (Retina, 15-inch, Late 2013) with 2 GHz Intel Core i7 and 8 GB of RAM and it takes about 15 hours to obtain the results).
+
+### 2.5 Classification
+
+Let us apply the same methodology used in the previous exercise to build classifiers of grade (g1 vs. g4). Even in this case we will use two features sets, one with 3000 genes and one with only the top genes identified from differantial analysis with edgeR.
+
+```{r classification hnsc}
+
+source(paste(PATH,"../code/xvalSelect.R",sep=""))
+source(paste(PATH,"../code/knn.R",sep=""))
+
+# training set with the best genes from the diffanal
+trainingSet1 <- subset(trainingSet,rownames(exprs(trainingSet)) %in% colnames(t(exprs(trainingSet))[,diff_list$edgeR]))
+# training set with all genes after filtering (3000)
+trainingSet2 <- trainingSet
+
+## generate a vector of fold assignments (in this case, 3 folds) for the first features set
+set.seed(987) # for reproducible results
+split <- xvalSelect(sample.size=ncol(trainingSet1),nfolds=3,cls=pData(trainingSet1)[,"patient.neoplasm_histologic_grade"])
+
+trnSet1_1 <- trainingSet1[,split!=1]
+trnSet1_2 <- trainingSet1[,split!=2]
+trnSet1_3 <- trainingSet1[,split!=3]
+tstSet1_1 <- trainingSet1[,split==1]
+tstSet1_2 <- trainingSet1[,split==2]
+tstSet1_3 <- trainingSet1[,split==3]
+
+table(pData(trnSet1_1)[,"patient.neoplasm_histologic_grade"])
+table(pData(tstSet1_1)[,"patient.neoplasm_histologic_grade"])
+
+rownames(exprs(trnSet1_1))<-fData(trnSet1_1)$hgnc_symbol
+rownames(exprs(trnSet1_2))<-fData(trnSet1_2)$hgnc_symbol
+rownames(exprs(trnSet1_3))<-fData(trnSet1_3)$hgnc_symbol
+rownames(exprs(tstSet1_1))<-fData(tstSet1_1)$hgnc_symbol
+rownames(exprs(tstSet1_2))<-fData(tstSet1_2)$hgnc_symbol
+rownames(exprs(tstSet1_3))<-fData(tstSet1_3)$hgnc_symbol
+
+#now the same with the second training set
+set.seed(987) # for reproducible results
+split <- xvalSelect(sample.size=ncol(trainingSet2),nfolds=3,cls=pData(trainingSet2)[,"patient.neoplasm_histologic_grade"])
+
+trnSet2_1 <- trainingSet2[,split!=1]
+trnSet2_2 <- trainingSet2[,split!=2]
+trnSet2_3 <- trainingSet2[,split!=3]
+tstSet2_1 <- trainingSet2[,split==1]
+tstSet2_2 <- trainingSet2[,split==2]
+tstSet2_3 <- trainingSet2[,split==3]
+
+table(pData(trnSet2_1)[,"patient.neoplasm_histologic_grade"])
+table(pData(tstSet2_1)[,"patient.neoplasm_histologic_grade"])
+
+rownames(exprs(trnSet2_1))<-fData(trnSet2_1)$hgnc_symbol
+rownames(exprs(trnSet2_2))<-fData(trnSet2_2)$hgnc_symbol
+rownames(exprs(trnSet2_3))<-fData(trnSet2_3)$hgnc_symbol
+rownames(exprs(tstSet2_1))<-fData(tstSet2_1)$hgnc_symbol
+rownames(exprs(tstSet2_2))<-fData(tstSet2_2)$hgnc_symbol
+rownames(exprs(tstSet2_3))<-fData(tstSet2_3)$hgnc_symbol
+
+```
+
+#### 2.5.1 Random forest
+
+```{r random forest hnsc, warning=FALSE, message=FALSE}
+
+require(randomForest)
+
+# we start with the first features set
+
+RF1_1 <- randomForest(x=t(exprs(trnSet1_1)),y=factor(trnSet1_1$patient.neoplasm_histologic_grade),ntree=1000,importance=TRUE)
+print(RF1_1)
+#prediction on the first Test-fold
+RF1_1.pred <- predict(RF1_1, t(exprs(tstSet1_1)))
+table(observed = tstSet1_1$patient.neoplasm_histologic_grade, predicted = RF1_1.pred)
+
+RF1_2 <- randomForest(x=t(exprs(trnSet1_2)),y=factor(trnSet1_2$patient.neoplasm_histologic_grade),ntree=1000,importance=TRUE)
+print(RF1_2)
+#prediction on the second Test-fold
+RF1_2.pred <- predict(RF1_2, t(exprs(tstSet1_2)))
+table(observed = tstSet1_2$patient.neoplasm_histologic_grade, predicted = RF1_2.pred)
+
+RF1_3 <- randomForest(x=t(exprs(trnSet1_3)),y=factor(trnSet1_3$patient.neoplasm_histologic_grade),ntree=1000,importance=TRUE)
+print(RF1_3)
+#prediction on the third Test-fold
+RF1_3.pred <- predict(RF1_3, t(exprs(tstSet1_3)))
+table(observed = tstSet1_3$patient.neoplasm_histologic_grade, predicted = RF1_3.pred)
+
+
+# second features set with all genes
+
+RF2_1 <- randomForest(x=t(exprs(trnSet2_1)),y=factor(trnSet2_1$patient.neoplasm_histologic_grade),ntree=1000,importance=TRUE)
+print(RF2_1)
+#prediction on the first Test-fold
+RF2_1.pred <- predict(RF2_1, t(exprs(tstSet2_1)))
+table(observed = tstSet2_1$patient.neoplasm_histologic_grade, predicted = RF2_1.pred)
+
+RF2_2 <- randomForest(x=t(exprs(trnSet2_2)),y=factor(trnSet2_2$patient.neoplasm_histologic_grade),ntree=1000,importance=TRUE)
+print(RF2_2)
+#prediction on the second Test-fold
+RF2_2.pred <- predict(RF2_2, t(exprs(tstSet2_2)))
+table(observed = tstSet2_2$patient.neoplasm_histologic_grade, predicted = RF2_2.pred)
+
+RF2_3 <- randomForest(x=t(exprs(trnSet2_3)),y=factor(trnSet2_3$patient.neoplasm_histologic_grade),ntree=1000,importance=TRUE)
+print(RF2_3)
+#prediction on the third Test-fold
+RF2_3.pred <- predict(RF2_3, t(exprs(tstSet2_3)))
+table(observed = tstSet2_3$patient.neoplasm_histologic_grade, predicted = RF2_3.pred)
+
+```
+
+#### 2.5.2 Adaboost
+
+```{r adaboost hnsc, warning=FALSE, message=FALSE }
+
+library("adabag")
+
+# we start with the first features set
+
+#fold 1
+patient.neoplasm_histologic_grade<-trnSet1_1$patient.neoplasm_histologic_grade
+
+adaboost1_1<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trnSet1_1))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-tstSet1_1$patient.neoplasm_histologic_grade
+
+adaboost1_1.pred<-predict.boosting(adaboost1_1, newdata = cbind(as.data.frame(t(exprs(tstSet1_1))), patient.neoplasm_histologic_grade))
+
+adaboost1_1.pred$confusion
+
+
+#fold 2
+patient.neoplasm_histologic_grade<-trnSet1_2$patient.neoplasm_histologic_grade
+
+adaboost1_2<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trnSet1_2))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-tstSet1_2$patient.neoplasm_histologic_grade
+
+adaboost1_2.pred<-predict.boosting(adaboost1_2, newdata = cbind(as.data.frame(t(exprs(tstSet1_2))), patient.neoplasm_histologic_grade))
+
+adaboost1_2.pred$confusion
+
+
+#fold 3
+patient.neoplasm_histologic_grade<-trnSet1_3$patient.neoplasm_histologic_grade
+
+adaboost1_3<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trnSet1_3))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-tstSet1_3$patient.neoplasm_histologic_grade
+
+adaboost1_3.pred<-predict.boosting(adaboost1_3, newdata = cbind(as.data.frame(t(exprs(tstSet1_3))), patient.neoplasm_histologic_grade))
+
+adaboost1_3.pred$confusion
+
+# second features set (6k genes)
+
+#fold 1
+patient.neoplasm_histologic_grade<-trnSet2_1$patient.neoplasm_histologic_grade
+
+adaboost2_1<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trnSet2_1))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-tstSet2_1$patient.neoplasm_histologic_grade
+adaboost2_1.pred<-predict.boosting(adaboost2_1, newdata = cbind(as.data.frame(t(exprs(tstSet2_1))), patient.neoplasm_histologic_grade))
+
+adaboost2_1.pred$confusion
+
+
+#fold 2
+patient.neoplasm_histologic_grade<-trnSet2_2$patient.neoplasm_histologic_grade
+
+adaboost2_2<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trnSet2_2))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-tstSet2_2$patient.neoplasm_histologic_grade
+
+adaboost2_2.pred<-predict.boosting(adaboost2_2, newdata = cbind(as.data.frame(t(exprs(tstSet2_2))), patient.neoplasm_histologic_grade))
+
+adaboost2_2.pred$confusion
+#fold 3
+patient.neoplasm_histologic_grade<-trnSet2_3$patient.neoplasm_histologic_grade
+
+adaboost2_3<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trnSet2_3))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-tstSet2_3$patient.neoplasm_histologic_grade
+
+adaboost2_3.pred<-predict.boosting(adaboost2_3, newdata = cbind(as.data.frame(t(exprs(tstSet2_3))), patient.neoplasm_histologic_grade))
+
+adaboost2_3.pred$confusion
+
+
+
+```
+#### 2.5.3 Logistic regression with LASSO
+
+```{r lasso-regression hnsc, warning=FALSE, message=FALSE}
+
+require(glmnet)
+
+#alpha=1 lasso, =0.5 elastic net
+
+## first training set
+#fold 1
+regression1_1 <- glmnet(x=t(exprs(trnSet1_1)),y=factor(trnSet1_1$patient.neoplasm_histologic_grade), family = "binomial", alpha=1)
+
+cv.regression1_1 <- cv.glmnet(x=t(exprs(trnSet1_1)),y=factor(trnSet1_1$patient.neoplasm_histologic_grade),alpha=1, family = "binomial" )
+
+best_lambda <- cv.regression1_1$lambda.min
+#prediction on Test Data
+regression1_1.pred <- predict(regression1_1, newx = t(exprs(tstSet1_1)),type = "class", s=best_lambda)
+#confusion matrix
+table(observed = tstSet1_1$patient.neoplasm_histologic_grade, predicted = regression1_1.pred)
+
+
+# fold 2
+regression1_2 <- glmnet(x=t(exprs(trnSet1_2)),y=factor(trnSet1_2$patient.neoplasm_histologic_grade), family = "binomial", alpha=1)
+
+cv.regression1_2 <- cv.glmnet(x=t(exprs(trnSet1_2)),y=factor(trnSet1_2$patient.neoplasm_histologic_grade),alpha=1, family = "binomial" )
+
+best_lambda <- cv.regression1_2$lambda.min
+#prediction on Test Data
+regression1_2.pred <- predict(regression1_2, newx = t(exprs(tstSet1_2)),type = "class", s=best_lambda)
+#confusion matrix
+table(observed = tstSet1_2$patient.neoplasm_histologic_grade, predicted = regression1_2.pred)
+
+
+# fold 3
+regression1_3 <- glmnet(x=t(exprs(trnSet1_3)),y=factor(trnSet1_3$patient.neoplasm_histologic_grade), family = "binomial", alpha=1)
+
+cv.regression1_3 <- cv.glmnet(x=t(exprs(trnSet1_3)),y=factor(trnSet1_3$patient.neoplasm_histologic_grade),alpha=1, family = "binomial" )
+
+best_lambda <- cv.regression1_3$lambda.min
+#prediction on Test Data
+regression1_3.pred <- predict(regression1_3, newx = t(exprs(tstSet1_3)),type = "class", s=best_lambda)
+#confusion matrix
+table(observed = tstSet1_3$patient.neoplasm_histologic_grade, predicted = regression1_3.pred)
+
+
+## second training set 
+#fold 1
+regression2_1 <- glmnet(x=t(exprs(trnSet2_1)),y=factor(trnSet2_1$patient.neoplasm_histologic_grade), family = "binomial", alpha=1)
+
+cv.regression2_1 <- cv.glmnet(x=t(exprs(trnSet2_1)),y=factor(trnSet2_1$patient.neoplasm_histologic_grade),alpha=1, family = "binomial" )
+
+best_lambda <- cv.regression2_1$lambda.min
+#prediction on Test Data
+regression2_1.pred <- predict(regression2_1, newx = t(exprs(tstSet2_1)),type = "class", s=best_lambda)
+#confusion matrix
+table(observed = tstSet2_1$patient.neoplasm_histologic_grade, predicted = regression2_1.pred)
+
+
+# fold 2
+regression2_2 <- glmnet(x=t(exprs(trnSet2_2)),y=factor(trnSet2_2$patient.neoplasm_histologic_grade), family = "binomial", alpha=1)
+
+cv.regression2_2 <- cv.glmnet(x=t(exprs(trnSet2_2)),y=factor(trnSet2_2$patient.neoplasm_histologic_grade),alpha=1, family = "binomial" )
+
+best_lambda <- cv.regression2_2$lambda.min
+#prediction on Test Data
+regression2_2.pred <- predict(regression2_2, newx = t(exprs(tstSet2_2)),type = "class", s=best_lambda)
+#confusion matrix
+table(observed = tstSet2_2$patient.neoplasm_histologic_grade, predicted = regression2_2.pred)
+
+
+# fold 3
+regression2_3 <- glmnet(x=t(exprs(trnSet2_3)),y=factor(trnSet2_3$patient.neoplasm_histologic_grade), family = "binomial", alpha=1)
+
+cv.regression2_3 <- cv.glmnet(x=t(exprs(trnSet2_3)),y=factor(trnSet2_3$patient.neoplasm_histologic_grade),alpha=1, family = "binomial" )
+
+best_lambda <- cv.regression2_3$lambda.min
+#prediction on Test Data
+regression2_3.pred <- predict(regression2_3, newx = t(exprs(tstSet2_3)),type = "class", s=best_lambda)
+#confusion matrix
+table(observed = tstSet2_3$patient.neoplasm_histologic_grade, predicted = regression2_3.pred)
+
+
+```
+
+#### 2.5.4 KNN
+
+```{r knn hnsc}
+
+#best genes
+
+knn1_1 <- knn.estimate(dat=t(exprs(trnSet1_1)),cls=pData(trnSet1_1)[,"patient.neoplasm_histologic_grade"],weight="none",k=3)
+knn1_1.pred <- knn.predict(dat=t(exprs(tstSet1_1)),model=knn1_1)
+
+ftable(levels(pData(tstSet1_1)[,"patient.neoplasm_histologic_grade"])[apply(knn1_1.pred,1,which.max)], # predictions
+       pData(tstSet1_1)[,"patient.neoplasm_histologic_grade"])                                  # actual
+
+knn1_2 <- knn.estimate(dat=t(exprs(trnSet1_2)),cls=pData(trnSet1_2)[,"patient.neoplasm_histologic_grade"],weight="none",k=3)
+knn1_2.pred <- knn.predict(dat=t(exprs(tstSet1_2)),model=knn1_2)
+
+ftable(levels(pData(tstSet1_2)[,"patient.neoplasm_histologic_grade"])[apply(knn1_2.pred,1,which.max)], # predictions
+       pData(tstSet1_2)[,"patient.neoplasm_histologic_grade"])                                  # actual
+
+
+knn1_3 <- knn.estimate(dat=t(exprs(trnSet1_3)),cls=pData(trnSet1_3)[,"patient.neoplasm_histologic_grade"],weight="none",k=3)
+knn1_3.pred <- knn.predict(dat=t(exprs(tstSet1_3)),model=knn1_3)
+
+ftable(levels(pData(tstSet1_3)[,"patient.neoplasm_histologic_grade"])[apply(knn1_3.pred,1,which.max)], # predictions
+       pData(tstSet1_3)[,"patient.neoplasm_histologic_grade"])                                  # actual
+
+
+#features set with 6k genes
+
+knn2_1 <- knn.estimate(dat=t(exprs(trnSet2_1)),cls=pData(trnSet2_1)[,"patient.neoplasm_histologic_grade"],weight="none",k=3)
+knn2_1.pred <- knn.predict(dat=t(exprs(tstSet2_1)),model=knn2_1)
+
+ftable(levels(pData(tstSet2_1)[,"patient.neoplasm_histologic_grade"])[apply(knn2_1.pred,1,which.max)], # predictions
+       pData(tstSet2_1)[,"patient.neoplasm_histologic_grade"])                                  # actual
+
+knn2_2 <- knn.estimate(dat=t(exprs(trnSet2_2)),cls=pData(trnSet2_2)[,"patient.neoplasm_histologic_grade"],weight="none",k=3)
+knn2_2.pred <- knn.predict(dat=t(exprs(tstSet2_2)),model=knn2_2)
+
+ftable(levels(pData(tstSet2_2)[,"patient.neoplasm_histologic_grade"])[apply(knn2_2.pred,1,which.max)], # predictions
+       pData(tstSet2_2)[,"patient.neoplasm_histologic_grade"])                                  # actual
+
+
+knn2_3 <- knn.estimate(dat=t(exprs(trnSet2_3)),cls=pData(trnSet2_3)[,"patient.neoplasm_histologic_grade"],weight="none",k=3)
+knn2_3.pred <- knn.predict(dat=t(exprs(tstSet2_3)),model=knn2_3)
+
+ftable(levels(pData(tstSet2_3)[,"patient.neoplasm_histologic_grade"])[apply(knn2_3.pred,1,which.max)], # predictions
+       pData(tstSet2_3)[,"patient.neoplasm_histologic_grade"])                                  # actual
+
+
+```
+
+
+#### 2.5.5 Evaluation of classifiers
+
+```{r evaluation hnsc, warning=FALSE, message=FALSE}
+
+require(pROC)
+
+# at first we consider the performance on the entire features set
+
+#RANDOM FOREST
+#calculate sensitivity
+RF_sens_mean2<- mean( c(sensitivity(factor(RF2_1.pred), factor(tstSet2_1$patient.neoplasm_histologic_grade)),
+sensitivity(factor(RF2_2.pred), factor(tstSet2_2$patient.neoplasm_histologic_grade)),
+sensitivity(factor(RF2_3.pred), factor(tstSet2_3$patient.neoplasm_histologic_grade))))
+
+#calculate specificity
+RF_spec_mean2<- mean( c(specificity(factor(RF2_1.pred), factor(tstSet2_1$patient.neoplasm_histologic_grade)),
+specificity(factor(RF2_2.pred), factor(tstSet2_2$patient.neoplasm_histologic_grade)),
+specificity(factor(RF2_3.pred), factor(tstSet2_3$patient.neoplasm_histologic_grade))))
+
+#calculate balanced accuracy
+RF_bal_acc2 <- (RF_sens_mean2+RF_spec_mean2)/2
+
+#KNN
+#calculate sensitivity
+knn_sens_mean2<- mean( c(sensitivity(factor(apply(knn2_1.pred,1,which.max)),factor(as.numeric(tstSet2_1$patient.neoplasm_histologic_grade))),sensitivity(factor(apply(knn2_2.pred,1,which.max)), factor(as.numeric(tstSet2_2$patient.neoplasm_histologic_grade))),
+sensitivity(factor(apply(knn2_3.pred,1,which.max)), factor(as.numeric(tstSet2_3$patient.neoplasm_histologic_grade)))))
+
+#calculate specificity
+knn_spec_mean2<- mean( c(specificity(factor(apply(knn2_1.pred,1,which.max)),factor(as.numeric(tstSet2_1$patient.neoplasm_histologic_grade))),specificity(factor(apply(knn2_2.pred,1,which.max)), factor(as.numeric(tstSet2_2$patient.neoplasm_histologic_grade))),
+specificity(factor(apply(knn2_3.pred,1,which.max)), factor(as.numeric(tstSet2_3$patient.neoplasm_histologic_grade)))))
+
+#calculate balanced accuracy
+knn_bal_acc2 <- (knn_sens_mean2+knn_spec_mean2)/2
+
+#ADABOOST
+#calculate sensitivity
+adaboost_sens_mean2<- mean( c(sensitivity(factor(adaboost2_1.pred$class), factor(tstSet2_1$patient.neoplasm_histologic_grade)),
+sensitivity(factor(adaboost2_2.pred$class), factor(tstSet2_2$patient.neoplasm_histologic_grade)),
+sensitivity(factor(adaboost2_3.pred$class), factor(tstSet2_3$patient.neoplasm_histologic_grade))))
+
+#calculate specificity
+adaboost_spec_mean2<- mean( c(specificity(factor(adaboost2_1.pred$class), factor(tstSet2_1$patient.neoplasm_histologic_grade)),
+specificity(factor(adaboost2_2.pred$class), factor(tstSet2_2$patient.neoplasm_histologic_grade)),
+specificity(factor(adaboost2_3.pred$class), factor(tstSet2_3$patient.neoplasm_histologic_grade))))
+
+#calculate balanced accuracy
+adaboost_bal_acc2 <- (adaboost_sens_mean2+adaboost_spec_mean2)/2
+
+#LASSO REGRESSION
+#calculate sensitivity
+lasso_sens_mean2<- mean( c(sensitivity(factor(regression2_1.pred), factor(tstSet2_1$patient.neoplasm_histologic_grade)),
+sensitivity(factor(regression2_2.pred), factor(tstSet2_2$patient.neoplasm_histologic_grade)),
+sensitivity(factor(regression2_3.pred), factor(tstSet2_3$patient.neoplasm_histologic_grade))))
+
+#calculate specificity
+lasso_spec_mean2<- mean( c(specificity(factor(regression2_1.pred), factor(tstSet2_1$patient.neoplasm_histologic_grade)),
+specificity(factor(regression2_2.pred), factor(tstSet2_2$patient.neoplasm_histologic_grade)),
+specificity(factor(regression2_3.pred), factor(tstSet2_3$patient.neoplasm_histologic_grade))))
+
+#calculate balanced accuracy
+lasso_bal_acc2 <- (lasso_sens_mean2+lasso_spec_mean2)/2
+
+
+result2 <- cbind(c(RF_sens_mean2, knn_sens_mean2,adaboost_sens_mean2,lasso_sens_mean2),c(RF_spec_mean2,knn_spec_mean2,adaboost_spec_mean2,lasso_spec_mean2),c(RF_bal_acc2,knn_bal_acc2,adaboost_bal_acc2,lasso_bal_acc2))
+rownames(result2)<-c("RF","KNN","AdABoost", "LASSO")
+colnames(result2)<-c("sensitivity","specificity","Balanced accuracy")
+result2
+
+
+# now we consider the features set with only the top genes
+
+#RANDOM FOREST
+#calculate sensitivity
+RF_sens_mean1<- mean( c(sensitivity(factor(RF1_1.pred), factor(tstSet1_1$patient.neoplasm_histologic_grade)),
+sensitivity(factor(RF1_2.pred), factor(tstSet1_2$patient.neoplasm_histologic_grade)),
+sensitivity(factor(RF1_3.pred), factor(tstSet1_3$patient.neoplasm_histologic_grade))))
+
+#calculate specificity
+RF_spec_mean1<- mean( c(specificity(factor(RF1_1.pred), factor(tstSet1_1$patient.neoplasm_histologic_grade)),
+specificity(factor(RF1_2.pred), factor(tstSet1_2$patient.neoplasm_histologic_grade)),
+specificity(factor(RF1_3.pred), factor(tstSet1_3$patient.neoplasm_histologic_grade))))
+
+#calculate balanced accuracy
+RF_bal_acc1 <- (RF_sens_mean1+RF_spec_mean1)/2
+
+
+#KNN
+#calculate sensitivity
+knn_sens_mean1<- mean( c(sensitivity(factor(apply(knn1_1.pred,1,which.max)),factor(as.numeric(tstSet1_1$patient.neoplasm_histologic_grade))),sensitivity(factor(apply(knn1_2.pred,1,which.max)), factor(as.numeric(tstSet1_2$patient.neoplasm_histologic_grade))),
+sensitivity(factor(apply(knn1_3.pred,1,which.max)), factor(as.numeric(tstSet1_3$patient.neoplasm_histologic_grade)))))
+
+#calculate specificity
+knn_spec_mean1<- mean( c(specificity(factor(apply(knn1_1.pred,1,which.max)),factor(as.numeric(tstSet1_1$patient.neoplasm_histologic_grade))),specificity(factor(apply(knn1_2.pred,1,which.max)), factor(as.numeric(tstSet1_2$patient.neoplasm_histologic_grade))),
+specificity(factor(apply(knn1_3.pred,1,which.max)), factor(as.numeric(tstSet1_3$patient.neoplasm_histologic_grade)))))
+
+#calculate balanced accuracy
+knn_bal_acc1 <- (knn_sens_mean1+knn_spec_mean1)/2
+
+
+#ADABOOST
+#calculate sensitivity
+adaboost_sens_mean1<- mean( c(sensitivity(factor(adaboost1_1.pred$class), factor(tstSet1_1$patient.neoplasm_histologic_grade)),
+sensitivity(factor(adaboost1_2.pred$class), factor(tstSet1_2$patient.neoplasm_histologic_grade)),
+sensitivity(factor(adaboost1_3.pred$class), factor(tstSet1_3$patient.neoplasm_histologic_grade))))
+
+#calculate specificity
+adaboost_spec_mean1<- mean( c(specificity(factor(adaboost1_1.pred$class), factor(tstSet1_1$patient.neoplasm_histologic_grade)),
+specificity(factor(adaboost1_2.pred$class), factor(tstSet1_2$patient.neoplasm_histologic_grade)),
+specificity(factor(adaboost1_3.pred$class), factor(tstSet1_3$patient.neoplasm_histologic_grade))))
+
+#calculate balanced accuracy
+adaboost_bal_acc1 <- (adaboost_sens_mean1+adaboost_spec_mean1)/2
+
+#LASSO REGRESSION
+#calculate sensitivity
+lasso_sens_mean1<- mean( c(sensitivity(factor(regression1_1.pred), factor(tstSet1_1$patient.neoplasm_histologic_grade)),
+sensitivity(factor(regression1_2.pred), factor(tstSet1_2$patient.neoplasm_histologic_grade)),
+sensitivity(factor(regression1_3.pred), factor(tstSet1_3$patient.neoplasm_histologic_grade))))
+
+#calculate specificity
+lasso_spec_mean1<- mean( c(specificity(factor(regression1_1.pred), factor(tstSet1_1$patient.neoplasm_histologic_grade)),
+specificity(factor(regression1_2.pred), factor(tstSet1_2$patient.neoplasm_histologic_grade)),
+specificity(factor(regression1_3.pred), factor(tstSet1_3$patient.neoplasm_histologic_grade))))
+
+#calculate balanced accuracy
+lasso_bal_acc1 <- (lasso_sens_mean1+lasso_spec_mean1)/2
+
+
+result1 <- cbind(c(RF_sens_mean1, knn_sens_mean1,adaboost_sens_mean1,lasso_sens_mean1),c(RF_spec_mean1,knn_spec_mean1,adaboost_spec_mean1,lasso_spec_mean1),c(RF_bal_acc1,knn_bal_acc1,adaboost_bal_acc1,lasso_bal_acc1))
+rownames(result1)<-c("RF","KNN", "AdABoost","LASSO")
+colnames(result1)<-c("sensitivity","specificity","Balanced accuracy")
+result1
+
+```
+
+We note that in this case the performances of our classifiers are very low in any case. Probably the data are too noisy to build a classifier with high performance. 
+
+#### 2.5.6 Final Results
+
+Now we try to apply the Adaboost with a reduce set of genes on the test set.
+
+```{r final results hnsc, warning=FALSE, message=FALSE}
+
+patient.neoplasm_histologic_grade<-trainingSet1$patient.neoplasm_histologic_grade
+
+adaboost<-boosting(patient.neoplasm_histologic_grade~.,data = cbind(as.data.frame(t(exprs(trainingSet1))), patient.neoplasm_histologic_grade))
+
+patient.neoplasm_histologic_grade<-testSet$patient.neoplasm_histologic_grade
+
+adaboost.pred<-predict.boosting(adaboost, newdata = cbind(as.data.frame(t(exprs(testSet))), patient.neoplasm_histologic_grade))
+
+adaboost.pred$confusion
+
+#calculate sensitivity
+sens <- sensitivity(factor(adaboost.pred$class), factor(testSet$patient.neoplasm_histologic_grade))
+sens
+
+#calculate specificity
+spec <- specificity(factor(adaboost.pred$class), factor(testSet$patient.neoplasm_histologic_grade))
+spec
+
+roc(testSet$patient.neoplasm_histologic_grade, adaboost.pred$votes[,1], plot = TRUE)
+
+bal_acc <- (sens+spec)/2
+bal_acc
+
+```
+
+We note that the performances are not good so we are not able to predict the class with an high accuracy. Moreover the dataset is unbalanced in fact if we observe the value of specificity is very low. So we can try with something different.
+
+#### 2.5.7 Support Vector Machines with MLSeq
+
+MLSeq package provides several algorithms, including support vector machines (SVM), to classify sequencing data. MLSeq package expects a count table that contains the number of reads mapped to each transcript for each sample and class label information of samples in an S4 class DESeqDataSet format.
+
+As we saw previously, RNA-Seq data is overdispersed. Results of some studies revealed that overdispersion has a significant effect on classification accuracies and should be taken into account before model building. When data is overdispersed, increasing the number of samples does not change the performance of classifiers. However, increasing number of features significantly increases overall model accuracies in most scenarios.
+
+We can transform our training and test data to DESeqDataSet instance, which is the main data structure in the MLSeq package. For this purpose, we use the DESeqDataSetFromMatrix function of DESeq2 package.
+For increase the performance of most classifiers MLSeq package use two normalization methods. In particular we used the ”deseq normalization”, which estimates the size factors by dividing each sample by the geometric means of the transcript counts. After the normalization process, it is useful to transform the data for classification analysis. There are two transformation methods available in MLSeq package. First one is the ”voom transformation” which applies a logarithmic transformation to normalized count data and computes gene weights using the mean-dispersion relationship. Second transformation method is the ”vst transformation” that uses an error modeling and the concept of variance stabilizing transformations to estimate the mean-dispersion relationship of data.
+We used a training set with 3000 genes for train the SVM and we choose ”deseq” as normalization method, ”vst” as transformation method. We also define the number of cross validation fold as ”cv=3” and number of repeats as ”rpt=3” for model validation.
+At the end we apply the classifier on the test set.
+SVM is capable of nonlinear classification and deal with high-dimensional data. Thus, it has been applied in many fields such as computational biology.
+
+
+```{r hnsc svm, warning=FALSE, message=FALSE}
+
+require("MLSeq")
+
+trainingSet3 <- HNSCF
+testSet3 <- HNSCF[,-trainIndex]
+
+
+colData <- data.frame(condition=as.character(pData(trainingSet3)[, "patient.neoplasm_histologic_grade"]))
+
+data.trainS4 = DESeqDataSetFromMatrix(countData = exprs(trainingSet3), colData = colData,
+    formula(~condition))
+data.trainS4 = DESeq(data.trainS4, fitType = "local")
+
+svm <- classify(data = data.trainS4, method = "svm",  ref = "g1" , deseqTransform = "vst", cv = 3, rpt = 3)
+svm
+
+colData <- data.frame(condition=as.character(pData(testSet3)[, "patient.neoplasm_histologic_grade"]))
+data.testS4 = DESeqDataSetFromMatrix(countData = exprs(testSet3), colData = colData,
+    formula(~condition))
+data.testS4 = DESeq(data.testS4, fitType = "local")
+
+pred.svm = predictClassify(svm, data.testS4)
+table(observed = testSet3$patient.neoplasm_histologic_grade, predicted = pred.svm)
+
+
+#calculate sensitivity
+sens_svm <- sensitivity(factor(pred.svm), factor(testSet3$patient.neoplasm_histologic_grade))
+sens_svm
+
+#calculate specificity
+spec_svm <- specificity(factor(pred.svm), factor(testSet3$patient.neoplasm_histologic_grade))
+spec_svm
+
+bal_acc_svm <- (sens_svm+spec_svm)/2
+bal_acc_svm
+
+```
+
+As we can see, this method work very good and we have an high improvement of performance. Using this package we can try also with bagSVM (SVM with bagging) for increase the performances but this method have an high computional cost. 
+
+## References
+
+- Lenz G, Wright G, Dave SS, Xiao W, Powell J, Zhao H, et al. Stromal gene signatures in large-B-cell lymphomas. N Engl J Med. 2008;359(22):2313–23.
+<br>
+
+- Cancer Genome Atlas Network. (2015). Comprehensive genomic characterization of head and neck squamous cell carcinomas. Nature, 517(7536), 576-582.
+<br>
+
+- Lee, J. K., Williams, P. D., & Cheon, S. (2008). Data Mining in Genomics. Clinics in Laboratory Medicine, 28(1), 145–viii. 
+<br>
+
+- Naba, A., Clauser, K. R., Hoersch, S., Liu, H., Carr, S. A., & Hynes, R. O. (2012). The Matrisome: In Silico Definition and In Vivo Characterization by Proteomics of Normal and Tumor Extracellular Matrices. Molecular & Cellular Proteomics: MCP, 11(4), M111.014647. 
+<br>
+
+- M. I. Love, W. Huber, S. Anders. (2014). Moderated estimation of fold change and dispersion for RNA-seq data with DESeq2. Genome Biology, 15:550.
+<br>
+
+- Robinson, MD, and Smyth, GK (2008). Small sample estimation of negative binomial dispersion, with applications to SAGE data. Biostatistics 9, 321–332.
+<br>
+
+- Robinson, MD, and Smyth, GK (2007). Moderated statistical tests for assessing differences in tag abundance. Bioinformatics 23, 2881–2887.
+<br>
+
+- Robinson, MD, McCarthy, DJ, Smyth, GK (2010). edgeR: a Bioconductor package for differential expression analysis of digital gene expression data. Bioinformatics 26, 139–140.
+<br>
+
+- David Lunn, Christopher Jackson, Nicky Best, Andrew Thomas and David Spiegelhalter. (2012). The BUGS Book - A Practical Introduction to Bayesian Analysis. CRC Press / Chapman and Hall.
+<br>
+
+- Yanming Di, Daniel W Schafer, Jason S Cumbie, and Jeff H Chang. (2011). The NBP negative binomial model for assessing differential gene expression from RNA-seq. Statistical Applications in Genetics and Molecular Biology, 10(1):24.
+<br>
+
+- Ann L Oberg, Brian M Bot, Diane E Grill, Gregory A Poland, and Terry M Therneau. (2012). Technical and biological variance structure in mRNA-Seq data: life in the real world. BMC genomics, 13(1):304.
+<br>
+
+- Gokmen Zararsiz, Dincer Goksuluk, Selcuk Korkmaz, Vahap Eldem, Izzet Parug Duru, Turgay Unver and Ahmet
+Ozturk (2016). MLSeq: Machine learning interface for RNA-Seq data. R package version 1.8.1.
+<br>
+
+- Anders S, Huber W (2010). Differential expression analysis for sequence count data. Genome Biology, 11(10):R106.
+<br>
+
+- Charity WL, Chen Y, Shi W, et al. (2014) Voom: precision weights unlock linear model analysis tools for RNA-Seq read counts, Genome Biology, 15:R29, doi:10.1186/gb–2014–15–2–r29.

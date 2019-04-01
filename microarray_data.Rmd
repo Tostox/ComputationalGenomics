@@ -1,6 +1,6 @@
 ---
 title: "Advanced Data Mining Methods in Computational Genomics"
-output: html_document
+output: rmarkdown::github_document
 ---
 
 #### Author: Gabriele Sotto

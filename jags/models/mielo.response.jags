@@ -1,0 +1,15 @@
+# -*- mode: R -*-
+
+model
+{
+  for ( i in 1:N )
+  {
+    y[i] ~ dbern(p[i])
+    logit(p[i]) <- alpha + beta*z[i]
+  }
+  alpha ~ dnorm( 0.0, alpha.tau )
+  beta ~ dnorm( 0.0, beta.tau )
+  #alpha ~ dnorm( 0.0, 0.01 )I(-3,3)
+  #beta ~ dnorm( 0.0, 0.01 )I(-3,3)
+}
+

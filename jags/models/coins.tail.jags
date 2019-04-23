@@ -1,0 +1,6 @@
+# -*- mode: R -*-
+
+model {
+    Y ~ dbin(0.5, 8)
+    P2 <- step(2.5 - Y)   # does Y = 2, 1 or 0?
+}

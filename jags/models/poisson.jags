@@ -1,0 +1,7 @@
+model {
+	for( i in 1:n) {
+		x[i] ~ dpois(lambda)
+	}
+	#prior for lambda, will use conjugate prior
+	lambda ~ dgamma(0.1,0.1)
+}

@@ -1,0 +1,21 @@
+# these examples rely on the R/qtl package, www.rqtl.org
+# install R/qtl package, within R, by typing install.packages("qtl")
+
+R_OPTS=--no-save --no-restore --no-init-file --no-site-file # vanilla, but with --environ
+
+all: HRclustering.html HRclustering.pdf
+
+HRclustering.html: HRclustering.Rmd
+	R ${R_OPTS} -e "rmarkdown::render('HRclustering.Rmd')"
+
+HRclustering.pdf: HRclustering.Rnw
+	R ${R_OPTS} -e "library(knitr);knit('HRclustering.Rnw')"
+	pdflatex HRclustering.tex
+
+#markdown_example.html: markdown_example.md
+#	R ${R_OPTS} -e "rmarkdown::render('markdown_example.md')"
+# Note that you could also use
+#	R ${R_OPTS} -e "markdown::markdownToHTML('markdown_example.md', 'markdown_example.html')"
+
+clean:
+	rm HRclustering.md HRclustering_asciidoc.txt HRclustering.tex

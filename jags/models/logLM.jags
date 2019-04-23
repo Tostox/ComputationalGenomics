@@ -1,0 +1,24 @@
+# -*- mode: R -*-
+
+model
+{
+  ## BEGIN loop over samples
+  ##
+  for(  iSample in 1:n.samples )
+  {
+    gene.data[iSample] ~ dlnorm( mu[iSample], data.tau )
+      
+    mu[iSample] <- beta0 +  beta.group * x.group[iSample]
+  }
+  ##
+  ## END loop over samples
+
+  fold.change <- pow(2,beta.group)
+  data.sd <- sqrt(1/data.tau)
+
+  ## parameters' priors
+  ##
+  data.tau ~ dgamma(1,1)
+  beta0 ~ dnorm(0, 0.001)
+  beta.group ~ dnorm(0, 0.001)  
+}

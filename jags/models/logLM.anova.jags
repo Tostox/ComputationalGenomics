@@ -1,0 +1,41 @@
+# -*- mode: R -*-
+
+model
+{
+  ## BEGIN loop over genes
+  ##
+  for ( iGene in 1:n.genes )
+  {
+    ## BEGIN loop over samples
+    ##
+    for(  iSample in 1:n.samples )
+    {
+      gene.data[iGene, iSample] ~ dlnorm(mu[iGene,iSample], data.tau[iGene])
+      
+      mu[iGene, iSample] <- subj.effect[iSample] +
+                            gene.effect[iGene] +
+                            beta.group[iGene] * x.group[iSample]
+    }
+    #
+    # END loop over samples
+
+    # parameters' priors
+    #
+    gene.effect[iGene] ~ dnorm(0, gene.tau[iGene])
+    beta.group[iGene] ~ dnorm(0, beta.tau[iGene])
+    
+    data.tau[iGene] ~ dgamma(1,1)
+    gene.tau[iGene] ~ dgamma(1,1)
+    beta.tau[iGene] ~ dgamma(1,1)
+
+    fold.change[iGene] <- exp(beta.group[iGene])
+  }
+  #
+  # END loop over genes
+  
+  for ( i in 1:n.samples )
+  {
+    subj.effect[i] ~ dnorm(0, subj.tau[i])
+    subj.tau[i] ~ dgamma(1,1)
+  }
+}

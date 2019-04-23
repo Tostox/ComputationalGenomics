@@ -1,0 +1,22 @@
+model
+{
+	
+		for (i in 1:nSample){
+		
+		y[i] ~ dnegbin(p[i],r)
+		
+		p[i]<- r/(mu[i]+r)
+		log(mu[i])<- alpha + beta*x[i]
+	}
+	
+	r ~ dcat(pi [])
+	for (i in 1:1000){
+		pi[i]<- 1/1000
+	}
+	
+	alpha ~ dnorm(0, 0.0001)
+	beta ~ dnorm(0, 0.0001)
+	
+	fold.change <- exp(beta)
+
+}

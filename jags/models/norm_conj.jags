@@ -1,0 +1,14 @@
+# -*- mode: R -*-
+
+model {
+    for(i in 1:n){
+        y[i] ~ dnorm(mu, tau)
+    }
+    sigma <- sqrt(1/tau)
+    
+    ## prior for mu
+    mu ~ dnorm(0, 0.001)
+    
+    ## tau = precision
+    tau ~ dgamma(1,1)
+}

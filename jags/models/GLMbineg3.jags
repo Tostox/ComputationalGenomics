@@ -1,0 +1,27 @@
+# -*- mode: R -*-
+
+model
+{
+  ## BEGIN loop over samples
+  ##
+  for(  iSample in 1:n.samples )
+  {
+    gene.data[iSample] ~ dnegbin( p[iSample], r )
+    
+    p[iSample] <- r/ (mu[iSample] + r)
+    
+    log(mu[iSample]) <- alpha + beta * x.group[iSample]
+  }
+  ##
+  ## END loop over samples
+
+  fold.change <- exp(beta)
+  
+
+  ## parameters' priors
+  ##
+  alpha ~ dnorm(0, 0.0001)
+  beta ~ dnorm(0, 0.0001)
+  r ~ dcat(pi[])
+  for (i in 1:1000) {pi[i] <- 1/1000}
+}

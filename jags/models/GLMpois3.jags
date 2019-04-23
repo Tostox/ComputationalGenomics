@@ -1,0 +1,24 @@
+# -*- mode: R -*-
+
+model
+{
+  ## BEGIN loop over samples
+  ##
+  for(  iSample in 1:n.samples )
+  {
+    gene.data[iSample] ~ dpois( mu[iSample] )
+      
+    log(mu[iSample]) <- alpha + beta * x.group[iSample]
+  }
+  ##
+  ## END loop over samples
+
+  fold.change <- exp(beta)
+  
+
+  ## parameters' priors
+  ##
+  alpha ~ dnorm(0, 0.0001)
+  beta ~ dnorm(0, 0.0001)
+  
+}

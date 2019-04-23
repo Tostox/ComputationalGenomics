@@ -1,0 +1,31 @@
+##############################
+##############################
+## download and install ESS: http://ess.r-project.org/
+## add the following commands to your .emacs file
+##
+;; ESS location
+
+(load "/Users/smonti/Research/Tools/emacs/ess/lisp/ess-site.el")
+## replace path above with actual path to location of your ess
+
+
+##############################
+## R MARKDOWN SUPPORT IN EMACS
+## http://stackoverflow.com/questions/16172345/how-can-i-use-emacs-ess-mode-with-r-markdown
+##
+git clone https://github.com/vitoshka/polymode.git
+##
+## add the following commands to .emacs
+##
+(defun rmd-mode ()
+  "ESS Markdown mode for rmd files"
+  (interactive)
+  (setq load-path 
+    (append (list "path/to/polymode/" "path/to/polymode/modes/")
+        load-path))
+  (require 'poly-R)
+  (require 'poly-markdown)     
+  (poly-markdown+r-mode))
+##
+## Now, if you already have ESS installed, just open your rmd file and
+## type Meta-Xrmd-mode and watch the beauty of Emacs.

@@ -1,0 +1,12 @@
+# -*- mode: R -*-
+
+model {
+    for ( iSample in 1:nSamples )
+    {
+        y[iSample] ~ dnorm(mu[iSample],tau)
+        mu[iSample] <- beta0 + beta1 * x[iSample]
+    }
+    beta0 ~ dnorm(0,.001) # 'diffuse' priors
+    beta1 ~ dnorm(0,.001) # w/ very low precision
+    tau ~ dgamma(1,1)
+}

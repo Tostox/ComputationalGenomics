@@ -1,0 +1,23 @@
+# -*- mode: R -*-
+
+model {
+    for(i in 1:n){
+        x[i] ~ dnorm(mu[i], tau[i])
+        mu[i] <- muClust[T[i]]
+        tau[i] <- tauClust[T[i]]
+        
+        ## cluster membership for each data point, modeled as categorical distribution
+        T[i] ~ dcat(pClust[1:nClust])
+    }
+    for(clustIdx in 1:nClust){
+        tauClust[clustIdx] ~ dgamma(0.01, 0.01)
+    }
+    muClust[1] ~ dnorm(0, 0.001)
+	
+    for(clustIdx in 2:nClust){
+        muClust[clustIdx] ~ dnorm(0, 0.001)I(muClust[clustIdx-1],)
+    }
+    ## dirichlet priors: conjugate prior for the categorical distribution
+    pClust[1:nClust] ~ ddirch(ddirchpriors)
+}
+

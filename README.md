@@ -6,3 +6,7 @@ In this work we analyse two datasets: a lymphoma dataset from Affymetrix gene ex
 ### Datasource:
 
 https://www.dropbox.com/sh/syikr2vr1nklnzn/AAChzd_oZOOCciZqErSitlQda?dl=0
+
+### Output HTML:
+
+https://tostox.github.io/ComputationalGenomics/final_notebook.html
